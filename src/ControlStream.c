@@ -2121,3 +2121,16 @@ int LiSendExecServerCmd(uint8_t cmdId) {
         false
     );
 }
+
+// Send an empty keepalive payload to the streaming machine
+int LiSendEmptyPayload() {
+    uint8_t payload[4] = {0xAA, 0x55, 0xAA, 0x55};
+    return sendMessageAndForget(
+        0x00,
+        sizeof(payload),
+        payload,
+        CTRL_CHANNEL_SERVERCTL,
+        ENET_PACKET_FLAG_RELIABLE,
+        false
+    );
+}

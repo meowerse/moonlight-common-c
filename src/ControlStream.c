@@ -342,6 +342,13 @@ static bool supportsIdrFrameRequest;
 //   uint16 y
 //   uint16 width
 //   uint16 height
+//
+// There is no negotiation of this version: a receiver that doesn't recognise it
+// discards the message entirely rather than parsing it field by field. So
+// bumping it turns viewport following off against a peer that only speaks the
+// older version, instead of degrading it. Prefer the reserved flags byte for
+// additive changes and keep the version bump for layout changes that genuinely
+// cannot be parsed by an older peer.
 #define VIEWPORT_PAYLOAD_VERSION 1
 #define VIEWPORT_PAYLOAD_LENGTH 10
 

@@ -491,7 +491,10 @@ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r
 // All values are in host desktop pixels. width and height are always non-zero.
 //
 // Hosts that do not implement the viewport extension never send this message,
-// so this callback is simply never invoked with them.
+// so this callback is simply never invoked with them. There is no capability
+// negotiation for this extension, so this echo is the only signal that the host
+// understood a viewport at all: a host that implements LiSendViewportEvent()
+// MUST report the rectangle it applied through this message.
 typedef void(*ConnListenerSetViewport)(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
@@ -510,10 +513,14 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
 
     // NB: New callbacks must be appended here (never inserted) so the offsets of
-    // existing fields don't move. Callers zero the struct with
-    // LiInitializeConnectionCallbacks() and the library substitutes a no-op stub
-    // for any callback left NULL, so a caller built against an older header does
-    // not need to be recompiled or set this field.
+    // existing fields don't move and existing source keeps compiling unchanged.
+    //
+    // This struct is NOT ABI stable. It carries no size or version field, and
+    // fixupMissingCallbacks() writes a stub into every NULL member, so a caller
+    // compiled against an older header linked against a newer library would be
+    // written past the end of its own allocation. Callers must be rebuilt
+    // against the matching header; the library cannot be swapped underneath a
+    // caller compiled against a different version of this struct.
     ConnListenerSetViewport setViewport;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
@@ -617,12 +624,16 @@ int LiSendEmptyPayload();
 // This function may only be called between LiStartConnection() and
 // LiStopConnection().
 //
+// A viewport that fails to transmit is retried by the library on its next
+// coalescing tick, so transmission failure is not reported to the caller.
+//
 // Returns 0 if the viewport was accepted (sent or coalesced for sending).
 // Returns -1 if width or height is zero.
 // Returns -2 if the control stream is not connected.
 // Returns -3 if the host does not support the viewport extension. This is not
 // an error condition: it just means viewport-following is unavailable and the
-// stream behaves exactly as it would without this call.
+// stream behaves exactly as it would without this call. Callers should treat it
+// as "disable viewport following for this session" rather than as a failure.
 int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 
 // This function queues a relative mouse move event to be sent to the remote server.

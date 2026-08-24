@@ -16,6 +16,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  packet-type-tables:
+    runs-on: ubuntu-latest
+    name: Packet type tables
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The five packetTypesGen* arrays in src/ControlStream.c are indexed by the
+      # same IDX_* constants and have already drifted out of sync once, which made
+      # lookups read the wrong packet type or past the end of the array.
+      - name: Check packet type table alignment
+        run: python3 tools/check-packet-type-tables.py
+
   build:
     strategy:
       fail-fast: false

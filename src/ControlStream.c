@@ -433,7 +433,11 @@ int initializeControlStream(void) {
     memset(&viewportLastSentRect, 0, sizeof(viewportLastSentRect));
     viewportPending = false;
     viewportEverSent = false;
-    viewportLastSendTimeMs = 0;
+
+    // Backdate so the first viewport update is sent immediately. Unsigned
+    // arithmetic makes this correct even if PltGetMillis() is currently smaller
+    // than the interval.
+    viewportLastSendTimeMs = PltGetMillis() - VIEWPORT_MIN_SEND_INTERVAL_MS;
 
     return 0;
 }
@@ -1531,6 +1535,7 @@ static void sendPendingViewportLocked(void) {
     char payload[VIEWPORT_PAYLOAD_LENGTH];
     BYTE_BUFFER bb;
     VIEWPORT_RECT rect = viewportPendingRect;
+    bool sent;
 
     BbInitializeWrappedBuffer(&bb, payload, 0, sizeof(payload), BYTE_ORDER_LITTLE);
     BbPut8(&bb, VIEWPORT_PAYLOAD_VERSION);
@@ -1540,24 +1545,31 @@ static void sendPendingViewportLocked(void) {
     BbPut16(&bb, rect.width);
     BbPut16(&bb, rect.height);
 
-    // Consume the pending update before sending. A send failure must not leave
-    // us spinning on the same rectangle, and it is not fatal to the stream.
-    viewportPending = false;
-    viewportEverSent = true;
-    viewportLastSentRect = rect;
-
     // Sent reliably so the host and client never disagree about the final
     // rectangle after the user stops panning.
-    if (!sendMessageAndForget(packetTypes[IDX_VIEWPORT],
-                              sizeof(payload),
-                              payload,
-                              CTRL_CHANNEL_SERVERCTL,
-                              ENET_PACKET_FLAG_RELIABLE,
-                              false)) {
+    sent = sendMessageAndForget(packetTypes[IDX_VIEWPORT],
+                                sizeof(payload),
+                                payload,
+                                CTRL_CHANNEL_SERVERCTL,
+                                ENET_PACKET_FLAG_RELIABLE,
+                                false);
+
+    // Stamp the attempt either way, so a failure is retried at the normal rate
+    // rather than as fast as the caller can spin.
+    viewportLastSendTimeMs = PltGetMillis();
+
+    if (sent) {
+        viewportPending = false;
+        viewportEverSent = true;
+        viewportLastSentRect = rect;
+    }
+    else {
+        // Leave the update pending so flushPendingViewportEvent() retries it.
+        // Committing it here would make the deduplication below swallow every
+        // later call with the same rectangle, stranding the host on a stale
+        // crop for the rest of the session.
         Limelog("Failed to send viewport event\n");
     }
-
-    viewportLastSendTimeMs = PltGetMillis();
 }
 
 // Sends the trailing viewport update that LiSendViewportEvent() rate limited
@@ -1567,7 +1579,7 @@ static void flushPendingViewportEvent(void) {
     PltLockMutex(&viewportMutex);
 
     if (viewportPending &&
-            packetTypes[IDX_VIEWPORT] != -1 &&
+            packetTypes != NULL && packetTypes[IDX_VIEWPORT] != -1 &&
             peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED &&
             PltGetMillis() - viewportLastSendTimeMs >= VIEWPORT_MIN_SEND_INTERVAL_MS) {
         sendPendingViewportLocked();
@@ -1652,6 +1664,13 @@ static void lossStatsThreadFunc(void* context) {
         }
 
         while (!PltIsThreadInterrupted(&lossStatsThread)) {
+            // No host reachable on this codepath supports the viewport extension
+            // today (it requires the encrypted control stream, which implies
+            // usePeriodicPing above), so this is a no-op. It is called anyway so
+            // the trailing update can never be silently dropped if that ever
+            // stops being true.
+            flushPendingViewportEvent();
+
             // Construct the payload
             BbInitializeWrappedBuffer(&byteBuffer, lossStatsPayload, 0, payloadLengths[IDX_LOSS_STATS], BYTE_ORDER_LITTLE);
             BbPut32(&byteBuffer, 0);
@@ -2303,17 +2322,24 @@ int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
         return -1;
     }
 
-    // The control stream must be up. Like LiGetEstimatedRttInfo(), this may only
-    // be called between LiStartConnection() and LiStopConnection().
-    if (peer == NULL || peer->state != ENET_PEER_STATE_CONNECTED) {
+    // No control stream has been set up at all
+    if (packetTypes == NULL) {
         return -2;
     }
 
     // The host doesn't understand this message (any non-Apollo host, and any
-    // host older than the encrypted control stream). Nothing is sent, and the
-    // stream behaves exactly as it did before this function existed.
-    if (packetTypes == NULL || packetTypes[IDX_VIEWPORT] == -1) {
+    // host older than the encrypted control stream). Checked before the peer so
+    // that a legacy host, which never has an ENet peer at all, reports the
+    // truthful "unsupported" rather than "not connected".
+    if (packetTypes[IDX_VIEWPORT] == -1) {
         return -3;
+    }
+
+    // The control stream must be up. Like LiGetEstimatedRttInfo(), this is a
+    // convenience check and not a synchronization point: it is why this may only
+    // be called between LiStartConnection() and LiStopConnection().
+    if (peer == NULL || peer->state != ENET_PEER_STATE_CONNECTED) {
+        return -2;
     }
 
     rect.x = x;
@@ -2334,8 +2360,9 @@ int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 
     // Send immediately on the leading edge, then at most one message per
     // VIEWPORT_MIN_SEND_INTERVAL_MS. flushPendingViewportEvent() delivers
-    // whatever is left over once the caller stops moving.
-    if (!viewportEverSent || PltGetMillis() - viewportLastSendTimeMs >= VIEWPORT_MIN_SEND_INTERVAL_MS) {
+    // whatever is left over once the caller stops moving, including a retry of
+    // anything that failed to send.
+    if (PltGetMillis() - viewportLastSendTimeMs >= VIEWPORT_MIN_SEND_INTERVAL_MS) {
         sendPendingViewportLocked();
     }
 

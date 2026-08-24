@@ -483,6 +483,20 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// This callback is invoked when the host reports the viewport rectangle it is
+// actually cropping the desktop to (see LiSendViewportEvent()). The host may
+// clamp or adjust a requested viewport to fit the desktop bounds or the encoder
+// aspect ratio, so this is the authoritative rectangle the encoded video covers.
+//
+// All values are in host desktop pixels. width and height are always non-zero.
+//
+// Hosts that do not implement the viewport extension never send this message,
+// so this callback is simply never invoked with them. There is no capability
+// negotiation for this extension, so this echo is the only signal that the host
+// understood a viewport at all: a host that implements LiSendViewportEvent()
+// MUST report the rectangle it applied through this message.
+typedef void(*ConnListenerSetViewport)(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -497,6 +511,17 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+
+    // NB: New callbacks must be appended here (never inserted) so the offsets of
+    // existing fields don't move and existing source keeps compiling unchanged.
+    //
+    // This struct is NOT ABI stable. It carries no size or version field, and
+    // fixupMissingCallbacks() writes a stub into every NULL member, so a caller
+    // compiled against an older header linked against a newer library would be
+    // written past the end of its own allocation. Callers must be rebuilt
+    // against the matching header; the library cannot be swapped underneath a
+    // caller compiled against a different version of this struct.
+    ConnListenerSetViewport setViewport;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -575,6 +600,41 @@ int LiSendExecServerCmd(uint8_t cmdId);
 // This function sends an empty payload to the server.
 // This method exists here for workaround client side wifi sleeps.
 int LiSendEmptyPayload();
+
+// This function tells the host which rectangle of its desktop the client is
+// currently displaying, so the host can crop to that rectangle before scaling
+// into the encoder. The encode resolution and bitrate are unchanged, so the
+// same number of bits describes a smaller area and zoomed-in content becomes
+// genuinely sharper rather than magnified.
+//
+// x, y, width and height are in host desktop pixels, with (0, 0) at the
+// top-left of the desktop. width and height must be non-zero.
+//
+// Coordinates are uint16, which covers any desktop up to 65535 pixels wide or
+// tall (an 8K display is 7680, and even a triple 4K span is 11520). A desktop
+// larger than that cannot be addressed by this message at all: the caller is
+// responsible for clamping, because a value that does not fit is truncated
+// silently by the implicit conversion at the call site.
+//
+// Updates are coalesced inside the library, so it is safe to call this on every
+// animation frame while the user pans or pinch-zooms. At most one message is
+// sent per 50 ms, redundant updates are dropped, and the final rectangle is
+// always delivered once the caller stops moving.
+//
+// This function may only be called between LiStartConnection() and
+// LiStopConnection().
+//
+// A viewport that fails to transmit is retried by the library on its next
+// coalescing tick, so transmission failure is not reported to the caller.
+//
+// Returns 0 if the viewport was accepted (sent or coalesced for sending).
+// Returns -1 if width or height is zero.
+// Returns -2 if the control stream is not connected.
+// Returns -3 if the host does not support the viewport extension. This is not
+// an error condition: it just means viewport-following is unavailable and the
+// stream behaves exactly as it would without this call. Callers should treat it
+// as "disable viewport following for this session" rather than as a failure.
+int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 
 // This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);

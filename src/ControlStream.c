@@ -83,6 +83,12 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             uint8_t left[DS_EFFECT_PAYLOAD_SIZE];
             uint8_t right[DS_EFFECT_PAYLOAD_SIZE];
         } dsAdaptiveTrigger;
+        struct {
+            uint16_t x;
+            uint16_t y;
+            uint16_t width;
+            uint16_t height;
+        } setViewport;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -143,6 +149,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_EXEC_SERVER_CMD 13
 #define IDX_SET_CLIPBOARD 14
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 15
+#define IDX_VIEWPORT 16
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -164,6 +171,7 @@ static const short packetTypesGen3[] = {
     -1,     // Execute Server Command (unused)
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
+    -1,     // Viewport event (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -182,6 +190,7 @@ static const short packetTypesGen4[] = {
     -1,     // Execute Server Command (unused)
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
+    -1,     // Viewport event (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -200,6 +209,7 @@ static const short packetTypesGen5[] = {
     -1,     // Execute Server Command (unused)
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
+    -1,     // Viewport event (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -218,6 +228,7 @@ static const short packetTypesGen7[] = {
     -1,     // Execute Server Command (unused)
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
+    -1,     // Viewport event (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -236,6 +247,7 @@ static const short packetTypesGen7Enc[] = {
     0x3000, // Execute Server Command (Apollo protocol extension)
     0x3001, // Set Clipboard (Apollo protocol extension)
     0x3002, // File transfer nonce request (Apollo protocol extension)
+    0x3003, // Viewport event (Apollo protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -316,6 +328,44 @@ static short* payloadLengths;
 static char**preconstructedPayloads;
 static bool supportsIdrFrameRequest;
 
+// Viewport ("foveated streaming") state.
+//
+// The client tells the host which rectangle of the host desktop it is currently
+// displaying so the host can crop to that rectangle before scaling into the
+// encoder. All coordinates are in host desktop pixels.
+//
+// The wire payload is 10 bytes, little endian (matching every other control
+// stream payload in this file):
+//   uint8  version (VIEWPORT_PAYLOAD_VERSION)
+//   uint8  flags   (reserved, must be 0)
+//   uint16 x
+//   uint16 y
+//   uint16 width
+//   uint16 height
+#define VIEWPORT_PAYLOAD_VERSION 1
+#define VIEWPORT_PAYLOAD_LENGTH 10
+
+// Viewport updates can be generated on every animation frame while the user is
+// panning or pinch-zooming. sendMessageEnet() blocks the calling thread for up
+// to 10 ms waiting for backpressure on reliable packets, and reliable traffic
+// shares the ENet peer's transmit window with input, so we coalesce updates
+// here instead of trusting every caller to do it.
+#define VIEWPORT_MIN_SEND_INTERVAL_MS 50
+
+typedef struct _VIEWPORT_RECT {
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+} VIEWPORT_RECT, *PVIEWPORT_RECT;
+
+static PLT_MUTEX viewportMutex;
+static VIEWPORT_RECT viewportPendingRect;
+static VIEWPORT_RECT viewportLastSentRect;
+static bool viewportPending;
+static bool viewportEverSent;
+static uint64_t viewportLastSendTimeMs;
+
 #define LOSS_REPORT_INTERVAL_MS 50
 #define PERIODIC_PING_INTERVAL_MS 100
 
@@ -327,6 +377,7 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&viewportMutex);
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -378,6 +429,11 @@ int initializeControlStream(void) {
     decryptionCtx = PltCreateCryptoContext();
     hdrEnabled = false;
     memset(&hdrMetadata, 0, sizeof(hdrMetadata));
+    memset(&viewportPendingRect, 0, sizeof(viewportPendingRect));
+    memset(&viewportLastSentRect, 0, sizeof(viewportLastSentRect));
+    viewportPending = false;
+    viewportEverSent = false;
+    viewportLastSendTimeMs = 0;
 
     return 0;
 }
@@ -403,6 +459,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
     PltDeleteMutex(&enetMutex);
+    PltDeleteMutex(&viewportMutex);
 }
 
 static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) {
@@ -1032,6 +1089,25 @@ static void asyncCallbackThreadFunc(void* context) {
                                                   queuedCb->data.dsAdaptiveTrigger.left,
                                                   queuedCb->data.dsAdaptiveTrigger.right);
             break;
+        case IDX_VIEWPORT:
+            // Only the most recent viewport rectangle is meaningful, so drop any
+            // older ones that are still queued behind this one.
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS && nextCb->typeIndex == queuedCb->typeIndex) {
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.setViewport(queuedCb->data.setViewport.x,
+                                          queuedCb->data.setViewport.y,
+                                          queuedCb->data.setViewport.width,
+                                          queuedCb->data.setViewport.height);
+            break;
         default:
             // Unhandled packet type from queueAsyncCallback()
             LC_ASSERT(false);
@@ -1050,7 +1126,8 @@ static bool needsAsyncCallback(unsigned short packetType) {
            packetType == packetTypes[IDX_HDR_INFO] ||
            packetType == packetTypes[IDX_DS_ADAPTIVE_TRIGGERS] ||
            packetType == packetTypes[IDX_SET_CLIPBOARD] ||
-           packetType == packetTypes[IDX_FILE_TRANSFER_NONCE_REQUEST];
+           packetType == packetTypes[IDX_FILE_TRANSFER_NONCE_REQUEST] ||
+           packetType == packetTypes[IDX_VIEWPORT];
 }
 
 static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
@@ -1110,6 +1187,41 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
         BbGetBytes(&bb, queuedCb->data.dsAdaptiveTrigger.left, DS_EFFECT_PAYLOAD_SIZE);
         BbGetBytes(&bb, queuedCb->data.dsAdaptiveTrigger.right, DS_EFFECT_PAYLOAD_SIZE);
         queuedCb->typeIndex = IDX_DS_ADAPTIVE_TRIGGERS;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_VIEWPORT]) {
+        uint8_t version;
+        uint8_t flags;
+
+        // Reject anything we can't fully parse rather than acting on garbage
+        if (!BbGet8(&bb, &version) ||
+                !BbGet8(&bb, &flags) ||
+                !BbGet16(&bb, &queuedCb->data.setViewport.x) ||
+                !BbGet16(&bb, &queuedCb->data.setViewport.y) ||
+                !BbGet16(&bb, &queuedCb->data.setViewport.width) ||
+                !BbGet16(&bb, &queuedCb->data.setViewport.height)) {
+            Limelog("Discarding truncated viewport message\n");
+            free(queuedCb);
+            return;
+        }
+
+        if (version != VIEWPORT_PAYLOAD_VERSION) {
+            Limelog("Discarding viewport message with unsupported version: %u\n", version);
+            free(queuedCb);
+            return;
+        }
+
+        if (queuedCb->data.setViewport.width == 0 || queuedCb->data.setViewport.height == 0) {
+            Limelog("Discarding viewport message with an empty rectangle\n");
+            free(queuedCb);
+            return;
+        }
+
+        // No flags are defined for version 1, so any that are set are ignored.
+        // A peer that needs the client to understand a new field must bump the
+        // version instead, which we reject above.
+        (void)flags;
+
+        queuedCb->typeIndex = IDX_VIEWPORT;
     }
     else {
         // Unhandled packet type from needsAsyncCallback()
@@ -1409,6 +1521,61 @@ static void controlReceiveThreadFunc(void* context) {
     }
 }
 
+static bool viewportRectEqual(const VIEWPORT_RECT* a, const VIEWPORT_RECT* b) {
+    return a->x == b->x && a->y == b->y && a->width == b->width && a->height == b->height;
+}
+
+// Sends viewportPendingRect. Must be called with viewportMutex held and only
+// when the host supports the viewport extension.
+static void sendPendingViewportLocked(void) {
+    char payload[VIEWPORT_PAYLOAD_LENGTH];
+    BYTE_BUFFER bb;
+    VIEWPORT_RECT rect = viewportPendingRect;
+
+    BbInitializeWrappedBuffer(&bb, payload, 0, sizeof(payload), BYTE_ORDER_LITTLE);
+    BbPut8(&bb, VIEWPORT_PAYLOAD_VERSION);
+    BbPut8(&bb, 0); // Flags (reserved)
+    BbPut16(&bb, rect.x);
+    BbPut16(&bb, rect.y);
+    BbPut16(&bb, rect.width);
+    BbPut16(&bb, rect.height);
+
+    // Consume the pending update before sending. A send failure must not leave
+    // us spinning on the same rectangle, and it is not fatal to the stream.
+    viewportPending = false;
+    viewportEverSent = true;
+    viewportLastSentRect = rect;
+
+    // Sent reliably so the host and client never disagree about the final
+    // rectangle after the user stops panning.
+    if (!sendMessageAndForget(packetTypes[IDX_VIEWPORT],
+                              sizeof(payload),
+                              payload,
+                              CTRL_CHANNEL_SERVERCTL,
+                              ENET_PACKET_FLAG_RELIABLE,
+                              false)) {
+        Limelog("Failed to send viewport event\n");
+    }
+
+    viewportLastSendTimeMs = PltGetMillis();
+}
+
+// Sends the trailing viewport update that LiSendViewportEvent() rate limited
+// away, so the host isn't left cropped to a stale rectangle after the user
+// stops moving. Called from the periodic control stream thread.
+static void flushPendingViewportEvent(void) {
+    PltLockMutex(&viewportMutex);
+
+    if (viewportPending &&
+            packetTypes[IDX_VIEWPORT] != -1 &&
+            peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED &&
+            PltGetMillis() - viewportLastSendTimeMs >= VIEWPORT_MIN_SEND_INTERVAL_MS) {
+        sendPendingViewportLocked();
+    }
+
+    PltUnlockMutex(&viewportMutex);
+}
+
 static void lossStatsThreadFunc(void* context) {
     BYTE_BUFFER byteBuffer;
 
@@ -1420,6 +1587,11 @@ static void lossStatsThreadFunc(void* context) {
         BbPut32(&byteBuffer, 0); // Timestamp?
 
         while (!PltIsThreadInterrupted(&lossStatsThread)) {
+            // Send any viewport update that was coalesced away by the rate limiter.
+            // This is a no-op unless the host supports the viewport extension and
+            // the client actually called LiSendViewportEvent().
+            flushPendingViewportEvent();
+
             // For Sunshine servers, send the more detailed per-frame FEC messages
             if (IS_SUNSHINE()) {
                 PQUEUED_FRAME_FEC_STATUS queuedFrameStatus;
@@ -2120,6 +2292,56 @@ int LiSendExecServerCmd(uint8_t cmdId) {
         ENET_PACKET_FLAG_RELIABLE,
         false
     );
+}
+
+// Send the client's current viewport rectangle to the streaming machine
+int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
+    VIEWPORT_RECT rect;
+
+    // An empty rectangle is meaningless and would make the host divide by zero
+    if (width == 0 || height == 0) {
+        return -1;
+    }
+
+    // The control stream must be up. Like LiGetEstimatedRttInfo(), this may only
+    // be called between LiStartConnection() and LiStopConnection().
+    if (peer == NULL || peer->state != ENET_PEER_STATE_CONNECTED) {
+        return -2;
+    }
+
+    // The host doesn't understand this message (any non-Apollo host, and any
+    // host older than the encrypted control stream). Nothing is sent, and the
+    // stream behaves exactly as it did before this function existed.
+    if (packetTypes == NULL || packetTypes[IDX_VIEWPORT] == -1) {
+        return -3;
+    }
+
+    rect.x = x;
+    rect.y = y;
+    rect.width = width;
+    rect.height = height;
+
+    PltLockMutex(&viewportMutex);
+
+    if (viewportEverSent && !viewportPending && viewportRectEqual(&rect, &viewportLastSentRect)) {
+        // The host already has this rectangle
+        PltUnlockMutex(&viewportMutex);
+        return 0;
+    }
+
+    viewportPendingRect = rect;
+    viewportPending = true;
+
+    // Send immediately on the leading edge, then at most one message per
+    // VIEWPORT_MIN_SEND_INTERVAL_MS. flushPendingViewportEvent() delivers
+    // whatever is left over once the caller stops moving.
+    if (!viewportEverSent || PltGetMillis() - viewportLastSendTimeMs >= VIEWPORT_MIN_SEND_INTERVAL_MS) {
+        sendPendingViewportLocked();
+    }
+
+    PltUnlockMutex(&viewportMutex);
+
+    return 0;
 }
 
 // Send an empty keepalive payload to the streaming machine

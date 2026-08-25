@@ -488,14 +488,27 @@ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r
 // clamp or adjust a requested viewport to fit the desktop bounds or the encoder
 // aspect ratio, so this is the authoritative rectangle the encoded video covers.
 //
-// All values are in host desktop pixels. width and height are always non-zero.
+// x, y, width and height are in the SAME reference space the request was sent
+// in: the negotiated stream resolution, before any crop is applied. See
+// LiSendViewportEvent() for why that, and not host desktop pixels, is the wire
+// convention. width and height are always non-zero.
 //
-// Hosts that do not implement the viewport extension never send this message,
-// so this callback is simply never invoked with them. There is no capability
-// negotiation for this extension, so this echo is the only signal that the host
-// understood a viewport at all: a host that implements LiSendViewportEvent()
-// MUST report the rectangle it applied through this message.
-typedef void(*ConnListenerSetViewport)(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
+// desktopWidth and desktopHeight are the size of the desktop the host is
+// capturing, in host desktop pixels, or 0 when the host did not report it. A
+// host that reports them lets the caller reconstruct the host's own letterbox
+// transform (the uncropped desktop scaled by min(streamW/desktopW,
+// streamH/desktopH) and centred in the stream frame), which is the only way the
+// caller can tell which part of the stream frame shows desktop and which part is
+// padding. Never assume they are present.
+//
+// THIS ECHO IS THE ONLY CAPABILITY SIGNAL. There is no negotiation for this
+// extension, and LiSendViewportEvent() returning 0 does NOT mean the host
+// understood anything -- see its documentation. A host that implements viewport
+// following MUST answer every understood request with this message, so a caller
+// that has sent a viewport and received no echo within a bounded time should
+// treat the host as not supporting the extension and stop sending.
+typedef void(*ConnListenerSetViewport)(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+                                       uint16_t desktopWidth, uint16_t desktopHeight);
 
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
@@ -607,14 +620,21 @@ int LiSendEmptyPayload();
 // same number of bits describes a smaller area and zoomed-in content becomes
 // genuinely sharper rather than magnified.
 //
-// x, y, width and height are in host desktop pixels, with (0, 0) at the
-// top-left of the desktop. width and height must be non-zero.
+// x, y, width and height are in the NEGOTIATED STREAM RESOLUTION -- the frame
+// the client is being sent, before any crop is applied -- with (0, 0) at its
+// top-left. They are NOT host desktop pixels. Nothing in the handshake tells the
+// client the host's desktop size (serverinfo does not carry it), so the client
+// provably cannot express a rectangle in desktop pixels; the stream resolution
+// is the only coordinate system both ends know, and it is the same reference
+// space LiSendMousePositionEvent() already uses. The host maps the rectangle
+// into its own desktop pixels, undoing whatever letterbox padding it applied,
+// and reports the result through ConnListenerSetViewport. width and height must
+// be non-zero.
 //
-// Coordinates are uint16, which covers any desktop up to 65535 pixels wide or
-// tall (an 8K display is 7680, and even a triple 4K span is 11520). A desktop
-// larger than that cannot be addressed by this message at all: the caller is
-// responsible for clamping, because a value that does not fit is truncated
-// silently by the implicit conversion at the call site.
+// Coordinates are uint16, which covers any stream resolution this library can
+// negotiate. The caller is still responsible for clamping, because a value that
+// does not fit is truncated silently by the implicit conversion at the call
+// site.
 //
 // Updates are coalesced inside the library, so it is safe to call this on every
 // animation frame while the user pans or pinch-zooms. At most one message is
@@ -625,15 +645,25 @@ int LiSendEmptyPayload();
 // LiStopConnection().
 //
 // A viewport that fails to transmit is retried by the library on its next
-// coalescing tick, so transmission failure is not reported to the caller.
+// coalescing tick, so transmission failure is not reported to the caller. The
+// final rectangle is also flushed during LiStopConnection() teardown, ignoring
+// the rate limit, so a terminal "uncrop" sent inside the coalescing window is
+// still delivered.
 //
 // Returns 0 if the viewport was accepted (sent or coalesced for sending).
 // Returns -1 if width or height is zero.
 // Returns -2 if the control stream is not connected.
-// Returns -3 if the host does not support the viewport extension. This is not
-// an error condition: it just means viewport-following is unavailable and the
-// stream behaves exactly as it would without this call. Callers should treat it
-// as "disable viewport following for this session" rather than as a failure.
+// Returns -3 if this host's packet-type table has no viewport entry at all.
+//
+// !! 0 IS NOT A CAPABILITY SIGNAL. !! -3 is returned only for the generations
+// that have no viewport entry in their table (GFE Gen 3/4/5 and unencrypted Gen
+// 7). Every host on the encrypted Gen 7 table -- which is Sunshine, Apollo and
+// modern GFE alike, because the table is selected purely from the advertised app
+// version -- gets a 0 and an actual packet on the wire, whether or not it has
+// ever heard of this extension. A host that does not implement it simply ignores
+// the packet. The ONLY way to learn that a host understood a viewport is to
+// receive a ConnListenerSetViewport echo; callers that care must gate on that
+// and stop sending when no echo arrives.
 int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 
 // This function queues a relative mouse move event to be sent to the remote server.

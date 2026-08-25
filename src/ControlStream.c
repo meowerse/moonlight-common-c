@@ -88,6 +88,9 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             uint16_t y;
             uint16_t width;
             uint16_t height;
+            // Captured desktop size, or 0/0 when the host did not report it.
+            uint16_t desktopWidth;
+            uint16_t desktopHeight;
         } setViewport;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
@@ -330,18 +333,29 @@ static bool supportsIdrFrameRequest;
 
 // Viewport ("foveated streaming") state.
 //
-// The client tells the host which rectangle of the host desktop it is currently
-// displaying so the host can crop to that rectangle before scaling into the
-// encoder. All coordinates are in host desktop pixels.
+// The client tells the host which rectangle of the stream frame it is currently
+// displaying so the host can map that back into its own desktop and crop to it
+// before scaling into the encoder.
 //
-// The wire payload is 10 bytes, little endian (matching every other control
+// COORDINATE SPACE: the negotiated stream resolution, uncropped -- NOT host
+// desktop pixels. The client is never told the host's desktop size (serverinfo
+// does not carry it), so the stream frame is the only space both ends can
+// compute. The host undoes its own letterbox padding to reach desktop pixels and
+// answers in the same stream space through ConnListenerSetViewport.
+//
+// The request payload is 10 bytes, little endian (matching every other control
 // stream payload in this file):
 //   uint8  version (VIEWPORT_PAYLOAD_VERSION)
-//   uint8  flags   (reserved, must be 0)
+//   uint8  flags   (VIEWPORT_FLAG_* bits; 0 on a request)
 //   uint16 x
 //   uint16 y
 //   uint16 width
 //   uint16 height
+//
+// The host's echo uses the same layout, plus two fields guarded by
+// VIEWPORT_FLAG_DESKTOP_EXTENT:
+//   uint16 desktopWidth
+//   uint16 desktopHeight
 //
 // There is no negotiation of this version: a receiver that doesn't recognise it
 // discards the message entirely rather than parsing it field by field. So
@@ -351,6 +365,15 @@ static bool supportsIdrFrameRequest;
 // cannot be parsed by an older peer.
 #define VIEWPORT_PAYLOAD_VERSION 1
 #define VIEWPORT_PAYLOAD_LENGTH 10
+
+// Flag bit meaning "uint16 desktopWidth, uint16 desktopHeight follow the
+// rectangle". Only ever set on an echo from the host.
+#define VIEWPORT_FLAG_DESKTOP_EXTENT 0x01
+
+// All flag bits this version knows how to act on. A message carrying anything
+// outside this mask came from a peer that expects us to understand a field we
+// do not, so the extra fields are ignored rather than guessed at.
+#define VIEWPORT_KNOWN_FLAGS VIEWPORT_FLAG_DESKTOP_EXTENT
 
 // Viewport updates can be generated on every animation frame while the user is
 // panning or pinch-zooming. sendMessageEnet() blocks the calling thread for up
@@ -1117,7 +1140,9 @@ static void asyncCallbackThreadFunc(void* context) {
             ListenerCallbacks.setViewport(queuedCb->data.setViewport.x,
                                           queuedCb->data.setViewport.y,
                                           queuedCb->data.setViewport.width,
-                                          queuedCb->data.setViewport.height);
+                                          queuedCb->data.setViewport.height,
+                                          queuedCb->data.setViewport.desktopWidth,
+                                          queuedCb->data.setViewport.desktopHeight);
             break;
         default:
             // Unhandled packet type from queueAsyncCallback()
@@ -1227,10 +1252,32 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
             return;
         }
 
-        // No flags are defined for version 1, so any that are set are ignored.
-        // A peer that needs the client to understand a new field must bump the
-        // version instead, which we reject above.
-        (void)flags;
+        // The captured desktop size is optional and host-supplied, so it is read
+        // only when the host says it is there and only if it is actually there.
+        // A flag without the bytes behind it is a malformed message rather than a
+        // reason to read past the payload, and a zero extent is meaningless; both
+        // fall back to "unknown" (0/0) rather than discarding an otherwise valid
+        // rectangle.
+        queuedCb->data.setViewport.desktopWidth = 0;
+        queuedCb->data.setViewport.desktopHeight = 0;
+        if (flags & VIEWPORT_FLAG_DESKTOP_EXTENT) {
+            if (!BbGet16(&bb, &queuedCb->data.setViewport.desktopWidth) ||
+                    !BbGet16(&bb, &queuedCb->data.setViewport.desktopHeight) ||
+                    queuedCb->data.setViewport.desktopWidth == 0 ||
+                    queuedCb->data.setViewport.desktopHeight == 0) {
+                Limelog("Viewport message claimed a desktop extent it did not carry\n");
+                queuedCb->data.setViewport.desktopWidth = 0;
+                queuedCb->data.setViewport.desktopHeight = 0;
+            }
+        }
+
+        // Bits outside VIEWPORT_KNOWN_FLAGS belong to fields added after this
+        // build. The rectangle is still valid and is delivered; the trailing
+        // bytes are ignored, which is exactly how this format is meant to grow
+        // without a version bump.
+        if (flags & ~(uint8_t)VIEWPORT_KNOWN_FLAGS) {
+            Limelog("Ignoring unknown viewport flags: 0x%02x\n", flags & ~(unsigned)VIEWPORT_KNOWN_FLAGS);
+        }
 
         queuedCb->typeIndex = IDX_VIEWPORT;
     }
@@ -1579,16 +1626,48 @@ static void sendPendingViewportLocked(void) {
     }
 }
 
+// Whether a pending viewport could be put on the wire right now, ignoring the
+// rate limit. Must be called with viewportMutex held.
+static bool canSendViewportLocked(void) {
+    return viewportPending &&
+           packetTypes != NULL && packetTypes[IDX_VIEWPORT] != -1 &&
+           peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED;
+}
+
 // Sends the trailing viewport update that LiSendViewportEvent() rate limited
 // away, so the host isn't left cropped to a stale rectangle after the user
 // stops moving. Called from the periodic control stream thread.
 static void flushPendingViewportEvent(void) {
     PltLockMutex(&viewportMutex);
 
-    if (viewportPending &&
-            packetTypes != NULL && packetTypes[IDX_VIEWPORT] != -1 &&
-            peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED &&
+    if (canSendViewportLocked() &&
             PltGetMillis() - viewportLastSendTimeMs >= VIEWPORT_MIN_SEND_INTERVAL_MS) {
+        sendPendingViewportLocked();
+    }
+
+    PltUnlockMutex(&viewportMutex);
+}
+
+// Sends the final viewport rectangle during teardown, IGNORING the rate limit.
+//
+// This exists because the terminal rectangle is almost always an "uncrop": a
+// caller that disconnects while zoomed sends the full frame on its way out, and
+// that send lands inside the 50 ms coalescing window far more often than not
+// (it directly follows the pan or pinch that prompted the disconnect). The
+// caller is told 0, meaning "accepted", the rectangle goes into viewportPending
+// -- and then stopControlStream() interrupts and joins the loss stats thread,
+// so the tick that would have flushed it never runs. The host is left cropped
+// to wherever the user happened to be looking, with no session left to correct
+// it. Deferring to the rate limiter here would trade a single extra packet
+// during teardown for exactly that.
+//
+// Called from stopControlStream() before the threads are torn down and before
+// the ENet peer is gracefully disconnected, which is the same window that
+// exists so final input (notably key-up events) reaches the host.
+static void flushFinalViewportEvent(void) {
+    PltLockMutex(&viewportMutex);
+
+    if (canSendViewportLocked()) {
         sendPendingViewportLocked();
     }
 
@@ -1863,6 +1942,11 @@ static void requestIdrFrameFunc(void* context) {
 
 // Stops the control stream
 int stopControlStream(void) {
+    // Put the caller's final viewport rectangle on the wire before anything is
+    // torn down. This is normally an uncrop, and it is the last chance to send
+    // it: the thread that would otherwise flush it is interrupted below.
+    flushFinalViewportEvent();
+
     stopping = true;
     LbqSignalQueueShutdown(&referenceFrameControlQueue);
     LbqSignalQueueShutdown(&frameFecStatusQueue);
@@ -2334,10 +2418,21 @@ int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
         return -2;
     }
 
-    // The host doesn't understand this message (any non-Apollo host, and any
-    // host older than the encrypted control stream). Checked before the peer so
-    // that a legacy host, which never has an ENet peer at all, reports the
-    // truthful "unsupported" rather than "not connected".
+    // This host's generation has no viewport entry in its packet-type table, so
+    // there is not even a number to send. That is GFE Gen 3/4/5 and unencrypted
+    // Gen 7 -- and ONLY those. Checked before the peer so that a legacy host,
+    // which never has an ENet peer at all, reports the truthful "unsupported"
+    // rather than "not connected".
+    //
+    // This is NOT a capability check, and callers must not read it as one. The
+    // table is chosen from the advertised app version alone (see
+    // initializeControlStream), so every encrypted-Gen-7 host -- Sunshine,
+    // Apollo and modern GFE alike -- takes the branch below and gets a real
+    // packet, whether or not it implements the extension. A host that does not
+    // implement it ignores the packet; the caller learns nothing from the
+    // return value. Only a ConnListenerSetViewport echo proves the host
+    // understood, which is why that callback is documented as the sole
+    // capability signal.
     if (packetTypes[IDX_VIEWPORT] == -1) {
         return -3;
     }

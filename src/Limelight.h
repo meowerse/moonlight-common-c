@@ -666,6 +666,22 @@ int LiSendEmptyPayload();
 // and stop sending when no echo arrives.
 int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 
+// As LiSendViewportEvent(), but skips both the "the host already has this
+// rectangle" check and the 50 ms rate limit, so the message really does go out.
+//
+// This exists for capability probing and nothing else. The
+// ConnListenerSetViewport echo is the only evidence that a host understands this
+// extension, and a host that has not finished initialising its capture path can
+// legitimately drop a probe that arrives too early. The retry that covers that
+// is, by definition, the same rectangle as the first probe -- so through
+// LiSendViewportEvent() it would be deduplicated away and the retry would be
+// theatre. Do not call this on a gesture path; that is what the rate limit is
+// for.
+//
+// Same return values as LiSendViewportEvent(), and the same caveat: 0 is not a
+// capability signal.
+int LiSendViewportEventForced(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
+
 // This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
 

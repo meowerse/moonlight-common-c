@@ -2404,8 +2404,15 @@ int LiSendExecServerCmd(uint8_t cmdId) {
     );
 }
 
-// Send the client's current viewport rectangle to the streaming machine
-int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
+// Send the client's current viewport rectangle to the streaming machine.
+//
+// `force` skips the "the host already has this rectangle" check. It exists for
+// capability probing: the ConnListenerSetViewport echo is the only evidence a
+// host understands this extension at all, and a probe can be legitimately
+// dropped by a host that has not finished initialising its capture path yet. The
+// retry that covers that is by definition the same rectangle as the first probe,
+// so the ordinary deduplication would swallow it and the retry would be theatre.
+static int sendViewportEventInternal(uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool force) {
     VIEWPORT_RECT rect;
 
     // An empty rectangle is meaningless and would make the host divide by zero
@@ -2451,7 +2458,7 @@ int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 
     PltLockMutex(&viewportMutex);
 
-    if (viewportEverSent && !viewportPending && viewportRectEqual(&rect, &viewportLastSentRect)) {
+    if (!force && viewportEverSent && !viewportPending && viewportRectEqual(&rect, &viewportLastSentRect)) {
         // The host already has this rectangle
         PltUnlockMutex(&viewportMutex);
         return 0;
@@ -2464,13 +2471,21 @@ int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
     // VIEWPORT_MIN_SEND_INTERVAL_MS. flushPendingViewportEvent() delivers
     // whatever is left over once the caller stops moving, including a retry of
     // anything that failed to send.
-    if (PltGetMillis() - viewportLastSendTimeMs >= VIEWPORT_MIN_SEND_INTERVAL_MS) {
+    if (force || PltGetMillis() - viewportLastSendTimeMs >= VIEWPORT_MIN_SEND_INTERVAL_MS) {
         sendPendingViewportLocked();
     }
 
     PltUnlockMutex(&viewportMutex);
 
     return 0;
+}
+
+int LiSendViewportEvent(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
+    return sendViewportEventInternal(x, y, width, height, false);
+}
+
+int LiSendViewportEventForced(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
+    return sendViewportEventInternal(x, y, width, height, true);
 }
 
 // Send an empty keepalive payload to the streaming machine
